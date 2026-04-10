@@ -13,6 +13,8 @@ from helpdesk_bridge.services.token_codec import build_issue_token, build_subjec
 
 logger = logging.getLogger(__name__)
 
+TRUSTED_GITHUB_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+
 
 async def _queue_send_mail_retry(
     *,
@@ -126,11 +128,24 @@ async def handle_github_event(
         if issue_number <= 0:
             return {"status": "ignored", "reason": "missing issue number"}
 
-        requester_email = extract_requester_contact(issue.get("body") or "")
-        if not requester_email:
-            return {"status": "ignored", "reason": "requester contact not found in issue body"}
-
         token = build_issue_token(issue_number, settings.bridge_token_secret)
+        thread = store.get_issue_thread_by_token(token)
+        requester_email = thread[1] if thread else None
+
+        if action == "opened":
+            association = str(issue.get("author_association") or "").upper()
+            if association not in TRUSTED_GITHUB_ASSOCIATIONS:
+                return {
+                    "status": "ignored",
+                    "reason": f"untrusted issue author association {association or 'UNKNOWN'}",
+                }
+
+            requester_email = extract_requester_contact(issue.get("body") or "")
+            if not requester_email:
+                return {"status": "ignored", "reason": "requester contact not found in issue body"}
+        elif not requester_email:
+            return {"status": "ignored", "reason": "requester contact not found for existing issue thread"}
+
         subject = build_subject(issue_number, issue.get("title") or "(no title)", settings.bridge_token_secret)
         body = _build_issue_email_body(action, issue, sender)
 
@@ -184,14 +199,15 @@ async def handle_github_event(
         if settings.bridge_comment_marker in comment_body:
             return {"status": "ignored", "reason": "bridge-authored comment"}
 
-        requester_email = extract_requester_contact(issue.get("body") or "")
-        if not requester_email:
-            return {"status": "ignored", "reason": "requester contact not found in issue body"}
+        token = build_issue_token(issue_number, settings.bridge_token_secret)
+        thread = store.get_issue_thread_by_token(token)
+        if not thread:
+            return {"status": "ignored", "reason": "requester contact not found for existing issue thread"}
+        requester_email = thread[1]
 
         subject = build_subject(issue_number, issue.get("title") or "(no title)", settings.bridge_token_secret)
         body = _build_comment_email_body(issue, comment, sender)
 
-        token = build_issue_token(issue_number, settings.bridge_token_secret)
         store.upsert_issue_thread(issue_number, token, requester_email)
         try:
             await graph_client.send_mail(settings.graph_support_mailbox, requester_email, subject, body)
